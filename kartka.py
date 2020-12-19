@@ -44,7 +44,6 @@ async def process(sonic: Client, output_dir: str, files: List[str]):
 
 
 async def ingest(args):
-    print(args)
     c = Client(host='127.0.0.1', port=1491, password='SecretPassword')
     await c.channel(Channel.INGEST)
     await process(c, ROOT, args.files)
