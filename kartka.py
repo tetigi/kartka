@@ -4,38 +4,61 @@
 from typing import List
 
 from PIL import Image
+import configparser
 import pytesseract
 import asyncio
 from asonic import Client
 from asonic.enums import Channel
-from zipfile import ZipFile
 from datetime import datetime
 import os.path
 import argparse
+import pickle
+import sys
+from googleapiclient.discovery import build
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from dataclasses import dataclass
 
 
-COLLECTION = 'letters'
-BUCKET = 'default'
-ROOT = '/Users/deepthought/Desktop'
+@dataclass
+class LayoutConfig:
+    data_dir: str
+    ingest_dir: str
+    drive_credentials: str
 
 
-async def process(sonic: Client, output_dir: str, files: List[str]):
+@dataclass
+class SearchConfig:
+    collection_name: str
+    bucket_name: str
+    sonic_host: str
+    sonic_port: int
+    sonic_password: str
+
+
+@dataclass
+class KartkaConfig:
+    layout: LayoutConfig
+    search: SearchConfig
+
+
+async def process(config: KartkaConfig, sonic: Client, drive, output_dir: str, files: List[str]):
     """Processes the provided images, generating their containing texts and packaging them into zips"""
     contents = ''
+    converted_images = []
     for file in files:
         with Image.open(file) as img:
             print(f'Processing {file}..')
             contents += pytesseract.image_to_string(img)
+            converted_images.append(img.convert('RGB'))
         contents += '\n'
 
     now = datetime.now()
-    output_file = now.strftime('%Y-%m-%d-%H%M') + '.zip'
+    output_file = now.strftime('%Y-%m-%d-%H%M') + '.pdf'
     output_path = output_dir + '/' + output_file
 
-    print('Zipping up images..')
-    with ZipFile(output_path, 'w') as zip:
-        for i, file in enumerate(files):
-            zip.write(file, f'page_{i}{os.path.splitext(file)[1]}')
+    print('Saving images as pdf..')
+    converted_images[0].save(output_path, save_all=True, append_images=converted_images[1:])
 
     print('Ingesting to sonic..')
     for line in contents.splitlines():
@@ -43,35 +66,149 @@ async def process(sonic: Client, output_dir: str, files: List[str]):
             await sonic.push(COLLECTION, BUCKET, output_file, line)
 
 
-async def ingest(args):
-    c = Client(host='127.0.0.1', port=1491, password='SecretPassword')
+async def ingest_cmd(config: KartkaConfig, drive, args):
+    c = create_sonic_client(config)
     await c.channel(Channel.INGEST)
-    await process(c, ROOT, args.files)
+    await process(config, c, drive, args.files)
 
 
-async def search(args):
-    c = Client(host='127.0.0.1', port=1491, password='SecretPassword')
+async def search_cmd(config: KartkaConfig, drive, args):
+    c = create_sonic_client(config)
     await c.channel(Channel.SEARCH)
-    entries = await c.query(COLLECTION, BUCKET, ' '.join(args.search_terms))
+
+    entries = await c.query(
+        config.search.collection_name,
+        config.search.bucket_name,
+        ' '.join(args.search_terms))
+
     for entry in entries:
         print(f'{ROOT}/{entry.decode("utf-8")}')
 
 
+SCOPES = ['https://www.googleapis.com/auth/drive.appdata', 'https://www.googleapis.com/auth/drive.file', 'https://www.googleapis.com/auth/drive.install']
+
+
+def create_sonic_client(config: KartkaConfig) -> Client:
+    return Client(host=config.search.sonic_host,
+                  port=config.search.sonic_port,
+                  password=config.search.sonic_password)
+
+
+def login_to_drive(config: LayoutConfig):
+    creds = None
+    pickle_path = os.path.join(config.data_dir, 'token.pickle')
+    if os.path.exists(pickle_path):
+        with open(pickle_path, 'rb') as token:
+            creds = pickle.load(token)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(config.drive_credentials, SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open(pickle_path, 'wb') as token:
+            pickle.dump(creds, token)
+
+    return build('drive', 'v3', credentials=creds)
+
+
+# TODO don't need to init anymore really.
+#def init_drive(drive):
+#    response = drive.files().list(
+#        q="'appDataFolder' in parents and mimeType = 'application/vnd.google-apps.folder'",
+#        spaces='appDataFolder',
+#        fields='files(id, name)').execute()
+#
+#    print('Searching..')
+#    print(response)
+#    got = False
+#    for file in response.get('files', []):
+#        print(file.get('name'))
+#        got = True
+#
+#    #if not got:
+#    #    print('not have')
+#    #    metadata = {
+#    #        'name': 'kartka',
+#    #        'mimeType': 'application/vnd.google-apps.folder',
+#    #        'parents': ['appDataFolder'],
+#    #    }
+#    #    file = drive.files().create(body=metadata, fields='id').execute()
+#    #    print(f'Folder ID: {file.get("id")}')
+
+
+def read_section(config, key):
+    if config.has_section(key):
+        return config[key]
+    else:
+        print(f'No section {key} found in provided configuration')
+        sys.exit(1)
+
+
+def read_conf(section, key):
+    if key in section:
+        return section[key]
+    else:
+        print(f'No {key} found in provided section')
+        sys.exit(1)
+
+
+def get_config(location) -> KartkaConfig:
+    config = configparser.ConfigParser(interpolation=configparser.ExtendedInterpolation())
+    config.read(location)
+
+    layout = read_section(config, 'layout')
+    search = read_section(config, 'search')
+    store = read_section(config, 'store')
+
+    return KartkaConfig(
+        layout=LayoutConfig(
+            data_dir=read_conf(layout, 'data_dir'),
+            ingest_dir=read_conf(layout, 'ingest_dir'),
+            drive_credentials=read_conf(layout, 'drive_credentials'),
+        ),
+        search=SearchConfig(
+            collection_name=read_conf(search, 'collection_name'),
+            bucket_name=read_conf(search, 'bucket_name'),
+            sonic_host=read_conf(search, 'sonic_host'),
+            sonic_port=read_conf(search, 'sonic_port'),
+            sonic_password=read_conf(search, 'sonic_password'),
+        ),
+    )
+
+
+def init_dirs(config: KartkaConfig):
+    os.makedirs(os.path.join(config.layout.data_dir, 'sonic'), exist_ok=True)
+    os.makedirs(os.path.join(config.layout.data_dir, 'files'), exist_ok=True)
+
+    os.makedirs(config.layout.ingest_dir, exist_ok=True)
+
+
+def main(args):
+    config = get_config(args.config)
+    init_dirs(config)
+
+    drive_service = login_to_drive(config.layout)
+
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(arguments.func(config, drive_service, arguments))
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Kartka')
+    parser.add_argument('--config', required=False, help='Kartka configuration file location', default='kartka.cfg')
+
     subparsers = parser.add_subparsers(dest='mode', help='The mode to use')
     subparsers.required = True
 
     ingest_parser = subparsers.add_parser('ingest', help='ingest a letter')
     ingest_parser.add_argument('files', nargs='+', help='in-order files to ingest')
-    ingest_parser.set_defaults(func=ingest)
+    ingest_parser.set_defaults(func=ingest_cmd)
 
     search_parser = subparsers.add_parser('search', help='search for letters')
     search_parser.add_argument('search_terms', nargs='+', help='terms to search for')
-    search_parser.set_defaults(func=search)
+    search_parser.set_defaults(func=search_cmd)
 
     arguments = parser.parse_args()
 
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(arguments.func(arguments))
-
+    main(arguments)

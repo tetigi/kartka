@@ -1,3 +1,5 @@
-venv/
+data/
 .idea
-data
+token.pickle
+kartka.cfg
+venv/
