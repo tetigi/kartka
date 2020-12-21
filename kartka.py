@@ -75,9 +75,20 @@ async def process(config: KartkaConfig, sonic: Client, drive, files: List[str]):
     response = drive.files().create(body=file_metadata, media_body=media, fields='id').execute()
 
     print('Ingesting to sonic..')
+    encoded_id = encode_id(now, response.get('id'))
+    print(encoded_id)
     for line in contents.splitlines():
         if line and not line.isspace():
-            await sonic.push(config.search.collection_name, config.search.bucket_name, response.get('id'), line)
+            await sonic.push(config.search.collection_name, config.search.bucket_name, encoded_id, line)
+
+
+def encode_id(dt: datetime, file_id: str) -> str:
+    return f'{dt.strftime("%Y-%m-%d_%H%M")}~{file_id}'
+
+
+def decode_id(encoded_id: str) -> (str, str):
+    dt_str, file_id = encoded_id.split('~')
+    return dt_str, file_id
 
 
 async def ingest_cmd(config: KartkaConfig, drive, args):
@@ -96,8 +107,9 @@ async def search_cmd(config: KartkaConfig, drive, args):
         config.search.bucket_name,
         ' '.join(args.search_terms))
 
-    for entry in entries:
-        print(f'https://drive.google.com/file/d/{entry.decode("utf-8")}/view?usp=sharing')
+    sorted_entries = reversed(sorted((decode_id(entry.decode('utf-8')) for entry in entries), key=lambda pair: pair[0]))
+    for (date_str, file_id) in sorted_entries:
+        print(f'{date_str.replace("_", " ")}\t -> https://drive.google.com/file/d/{file_id}/view?usp=sharing')
 
 
 SCOPES = ['https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/drive.file', 'https://www.googleapis.com/auth/drive.install']
@@ -133,7 +145,6 @@ def init_drive(drive) -> str:
         spaces='drive',
         fields='files(id, name)').execute()
 
-    print('Searching..')
     got = response.get('files', [])
 
     if not got:
