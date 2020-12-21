@@ -117,6 +117,13 @@ async def search_cmd(config: KartkaConfig, _, args):
         print(f'{date_str.replace("_", " ")}\t -> https://drive.google.com/file/d/{file_id}/view?usp=sharing')
 
 
+async def check_cmd(config: KartkaConfig, drive, args):
+    c = create_sonic_client(config)
+    await c.channel(Channel.SEARCH)
+
+    print(await c.ping())
+
+
 def create_sonic_client(config: KartkaConfig) -> Client:
     return Client(host=config.search.sonic_host,
                   port=config.search.sonic_port,
@@ -244,6 +251,9 @@ if __name__ == '__main__':
 
     subparsers = parser.add_subparsers(dest='mode', help='The mode to use')
     subparsers.required = True
+
+    check_parser = subparsers.add_parser('check', help='check connections')
+    check_parser.set_defaults(func=check_cmd)
 
     ingest_parser = subparsers.add_parser('ingest', help='ingest a letter')
     ingest_parser.add_argument('files', nargs='+', help='in-order files to ingest')
