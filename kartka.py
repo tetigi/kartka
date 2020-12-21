@@ -15,11 +15,14 @@ import os.path
 import argparse
 import argcomplete
 import pickle
+import io
 import sys
-from googleapiclient.discovery import build, MediaFileUpload
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from dataclasses import dataclass
+from pdf2image import convert_from_bytes
 
 
 SCOPES = ['https://www.googleapis.com/auth/drive',
@@ -55,34 +58,45 @@ class KartkaConfig:
     drive_base_id: str = None
 
 
-async def process(config: KartkaConfig, sonic: Client, drive, files: List[str]):
+@dataclass
+class KartkaDocument:
+    images: List[any]
+    name: str
+    contents: str = None
+    drive_id: str = None
+    created_time: datetime = None
+
+
+async def process(config: KartkaConfig, sonic: Client, drive, doc: KartkaDocument):
     """Processes the provided images, generating their containing texts and packaging them into zips"""
-    contents = ''
     converted_images = []
-    for file in files:
-        with Image.open(file) as img:
-            print(f'Processing {file}..')
-            contents += pytesseract.image_to_string(img)
-            converted_images.append(img.convert('RGB'))
-        contents += '\n'
 
-    now = datetime.now()
+    if not doc.contents:
+        doc.contents = ''
+        for img in doc.images:
+            with img:
+                doc.contents += pytesseract.image_to_string(img)
+                converted_images.append(img.convert('RGB'))
+            doc.contents += '\n'
+
     temp_dir = tempfile.TemporaryDirectory()
-    output_file = now.strftime('%Y-%m-%d-%H%M') + '.pdf'
-    output_path = os.path.join(temp_dir.name, output_file)
+    output_path = os.path.join(temp_dir.name, doc.name)
 
-    print('Saving images as pdf..')
-    converted_images[0].save(output_path, save_all=True, append_images=converted_images[1:])
+    if not doc.drive_id:
+        print('Saving images as pdf..')
+        converted_images[0].save(output_path, save_all=True, append_images=converted_images[1:])
 
-    print('Uploading to drive..')
-    file_metadata = {'name': output_file, 'parents': [config.drive_base_id]}
-    media = MediaFileUpload(output_path, mimetype='application/pdf')
-    response = drive.files().create(body=file_metadata, media_body=media, fields='id').execute()
+        print('Uploading to drive..')
+        file_metadata = {'name': doc.name, 'parents': [config.drive_base_id]}
+        media = MediaFileUpload(output_path, mimetype='application/pdf')
+        response = drive.files().create(body=file_metadata, media_body=media, fields='id').execute()
+        doc.drive_id = response.get('id')
 
     print('Ingesting to sonic..')
-    encoded_id = encode_id(now, response.get('id'))
-    print(encoded_id)
-    for line in contents.splitlines():
+    if not doc.created_time:
+        doc.created_time = datetime.now()
+    encoded_id = encode_id(doc.created_time, doc.drive_id)
+    for line in doc.contents.splitlines():
         if line and not line.isspace():
             await sonic.push(config.search.collection_name, config.search.bucket_name, encoded_id, line)
 
@@ -99,7 +113,14 @@ def decode_id(encoded_id: str) -> (str, str):
 async def ingest_cmd(config: KartkaConfig, drive, args):
     c = create_sonic_client(config)
     await c.channel(Channel.INGEST)
-    await process(config, c, drive, args.files)
+
+    now = datetime.now()
+    output_file = now.strftime('%Y-%m-%d-%H%M') + '.pdf'
+    doc = KartkaDocument(
+        images=list(Image.open(f) for f in args.files),
+        name=output_file,
+    )
+    await process(config, c, drive, doc)
     print('Done')
 
 
@@ -117,11 +138,54 @@ async def search_cmd(config: KartkaConfig, _, args):
         print(f'{date_str.replace("_", " ")}\t -> https://drive.google.com/file/d/{file_id}/view?usp=sharing')
 
 
-async def check_cmd(config: KartkaConfig, drive, args):
+async def check_cmd(config: KartkaConfig, drive, _):
     c = create_sonic_client(config)
     await c.channel(Channel.SEARCH)
 
-    print(await c.ping())
+    assert(await c.ping() == b'PONG')
+    drive.files().list().execute()
+    print('All checks passed.')
+
+
+async def hydrate_cmd(config: KartkaConfig, drive, args):
+    c = create_sonic_client(config)
+    await c.channel(Channel.INGEST)
+
+    print('Starting hydration from drive..')
+    page_token = None
+    while True:
+        response = drive.files().list(
+            q=f"'{config.drive_base_id}' in parents",
+            spaces='drive',
+            fields='nextPageToken, files(id, name, createdTime)',
+            pageToken=page_token
+        ).execute()
+
+        for file in response.get('files', []):
+            print(f'Downloading {file.get("name")}..')
+            request = drive.files().get_media(fileId=file.get('id'))
+            fh = io.BytesIO()
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while done is False:
+                status, done = downloader.next_chunk()
+                print('Downloaded %d%%..' % int(status.progress() * 100))
+
+            print('Converting to images..')
+            imgs = convert_from_bytes(fh.getvalue(), grayscale=True, thread_count=8, dpi=100)
+            doc = KartkaDocument(
+                images=imgs,
+                name=file.get('name'),
+                drive_id=file.get('id'),
+                created_time=datetime.strptime(file.get('createdTime'), '%Y-%m-%dT%H:%M:%S.%fZ')
+            )
+            print(f'Ingesting..')
+            await process(config, c, drive, doc)
+
+        page_token = response.get('nextPageToken', None)
+        if page_token is None:
+            break
+        print('Hydration complete!')
 
 
 def create_sonic_client(config: KartkaConfig) -> Client:
@@ -262,6 +326,9 @@ if __name__ == '__main__':
     search_parser = subparsers.add_parser('search', help='search for letters')
     search_parser.add_argument('search_terms', nargs='+', help='terms to search for').completer = sonic_suggestions
     search_parser.set_defaults(func=search_cmd)
+
+    hydrate_parser = subparsers.add_parser('hydrate', help='hydrate sonic from drive')
+    hydrate_parser.set_defaults(func=hydrate_cmd)
 
     argcomplete.autocomplete(parser)
     arguments = parser.parse_args()
