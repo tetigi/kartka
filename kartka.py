@@ -13,12 +13,17 @@ from asonic.enums import Channel
 from datetime import datetime
 import os.path
 import argparse
+import argcomplete
 import pickle
 import sys
 from googleapiclient.discovery import build, MediaFileUpload
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from dataclasses import dataclass
+
+
+SCOPES = ['https://www.googleapis.com/auth/drive',
+          'https://www.googleapis.com/auth/drive.file']
 
 
 @dataclass
@@ -98,7 +103,7 @@ async def ingest_cmd(config: KartkaConfig, drive, args):
     print('Done')
 
 
-async def search_cmd(config: KartkaConfig, drive, args):
+async def search_cmd(config: KartkaConfig, _, args):
     c = create_sonic_client(config)
     await c.channel(Channel.SEARCH)
 
@@ -110,9 +115,6 @@ async def search_cmd(config: KartkaConfig, drive, args):
     sorted_entries = reversed(sorted((decode_id(entry.decode('utf-8')) for entry in entries), key=lambda pair: pair[0]))
     for (date_str, file_id) in sorted_entries:
         print(f'{date_str.replace("_", " ")}\t -> https://drive.google.com/file/d/{file_id}/view?usp=sharing')
-
-
-SCOPES = ['https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/drive.file', 'https://www.googleapis.com/auth/drive.install']
 
 
 def create_sonic_client(config: KartkaConfig) -> Client:
@@ -221,6 +223,21 @@ def main(args):
     loop.run_until_complete(arguments.func(config, drive_service, arguments))
 
 
+def sonic_suggestions(prefix, parsed_args, **kwargs):
+    if len(prefix) < 2:
+        return []
+    else:
+        async def do_it():
+            config = get_config(parsed_args.config)
+            sonic = create_sonic_client(config)
+            await sonic.channel(Channel.SEARCH)
+            suggestions = await sonic.suggest(config.search.collection_name, config.search.bucket_name, prefix)
+            return list(s.decode('utf-8') for s in suggestions)
+
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(do_it())
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Kartka')
     parser.add_argument('--config', required=False, help='Kartka configuration file location', default='kartka.cfg')
@@ -233,9 +250,10 @@ if __name__ == '__main__':
     ingest_parser.set_defaults(func=ingest_cmd)
 
     search_parser = subparsers.add_parser('search', help='search for letters')
-    search_parser.add_argument('search_terms', nargs='+', help='terms to search for')
+    search_parser.add_argument('search_terms', nargs='+', help='terms to search for').completer = sonic_suggestions
     search_parser.set_defaults(func=search_cmd)
 
+    argcomplete.autocomplete(parser)
     arguments = parser.parse_args()
 
     main(arguments)
