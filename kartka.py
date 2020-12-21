@@ -7,6 +7,7 @@ from PIL import Image
 import configparser
 import pytesseract
 import asyncio
+import tempfile
 from asonic import Client
 from asonic.enums import Channel
 from datetime import datetime
@@ -14,7 +15,7 @@ import os.path
 import argparse
 import pickle
 import sys
-from googleapiclient.discovery import build
+from googleapiclient.discovery import build, MediaFileUpload
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from dataclasses import dataclass
@@ -37,12 +38,19 @@ class SearchConfig:
 
 
 @dataclass
+class StoreConfig:
+    drive_kartka_dir: str
+
+
+@dataclass
 class KartkaConfig:
     layout: LayoutConfig
     search: SearchConfig
+    store: StoreConfig
+    drive_base_id: str = None
 
 
-async def process(config: KartkaConfig, sonic: Client, drive, output_dir: str, files: List[str]):
+async def process(config: KartkaConfig, sonic: Client, drive, files: List[str]):
     """Processes the provided images, generating their containing texts and packaging them into zips"""
     contents = ''
     converted_images = []
@@ -54,22 +62,29 @@ async def process(config: KartkaConfig, sonic: Client, drive, output_dir: str, f
         contents += '\n'
 
     now = datetime.now()
+    temp_dir = tempfile.TemporaryDirectory()
     output_file = now.strftime('%Y-%m-%d-%H%M') + '.pdf'
-    output_path = output_dir + '/' + output_file
+    output_path = os.path.join(temp_dir.name, output_file)
 
     print('Saving images as pdf..')
     converted_images[0].save(output_path, save_all=True, append_images=converted_images[1:])
 
+    print('Uploading to drive..')
+    file_metadata = {'name': output_file, 'parents': [config.drive_base_id]}
+    media = MediaFileUpload(output_path, mimetype='application/pdf')
+    response = drive.files().create(body=file_metadata, media_body=media, fields='id').execute()
+
     print('Ingesting to sonic..')
     for line in contents.splitlines():
         if line and not line.isspace():
-            await sonic.push(COLLECTION, BUCKET, output_file, line)
+            await sonic.push(config.search.collection_name, config.search.bucket_name, response.get('id'), line)
 
 
 async def ingest_cmd(config: KartkaConfig, drive, args):
     c = create_sonic_client(config)
     await c.channel(Channel.INGEST)
     await process(config, c, drive, args.files)
+    print('Done')
 
 
 async def search_cmd(config: KartkaConfig, drive, args):
@@ -82,10 +97,10 @@ async def search_cmd(config: KartkaConfig, drive, args):
         ' '.join(args.search_terms))
 
     for entry in entries:
-        print(f'{ROOT}/{entry.decode("utf-8")}')
+        print(f'https://drive.google.com/file/d/{entry.decode("utf-8")}/view?usp=sharing')
 
 
-SCOPES = ['https://www.googleapis.com/auth/drive.appdata', 'https://www.googleapis.com/auth/drive.file', 'https://www.googleapis.com/auth/drive.install']
+SCOPES = ['https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/drive.file', 'https://www.googleapis.com/auth/drive.install']
 
 
 def create_sonic_client(config: KartkaConfig) -> Client:
@@ -112,29 +127,26 @@ def login_to_drive(config: LayoutConfig):
     return build('drive', 'v3', credentials=creds)
 
 
-# TODO don't need to init anymore really.
-#def init_drive(drive):
-#    response = drive.files().list(
-#        q="'appDataFolder' in parents and mimeType = 'application/vnd.google-apps.folder'",
-#        spaces='appDataFolder',
-#        fields='files(id, name)').execute()
-#
-#    print('Searching..')
-#    print(response)
-#    got = False
-#    for file in response.get('files', []):
-#        print(file.get('name'))
-#        got = True
-#
-#    #if not got:
-#    #    print('not have')
-#    #    metadata = {
-#    #        'name': 'kartka',
-#    #        'mimeType': 'application/vnd.google-apps.folder',
-#    #        'parents': ['appDataFolder'],
-#    #    }
-#    #    file = drive.files().create(body=metadata, fields='id').execute()
-#    #    print(f'Folder ID: {file.get("id")}')
+def init_drive(drive) -> str:
+    response = drive.files().list(
+        q="name = 'kartka' and mimeType = 'application/vnd.google-apps.folder'",
+        spaces='drive',
+        fields='files(id, name)').execute()
+
+    print('Searching..')
+    got = response.get('files', [])
+
+    if not got:
+        print('Setting up drive directory..')
+        metadata = {
+            'name': 'kartka',
+            'mimeType': 'application/vnd.google-apps.folder',
+        }
+        file = drive.files().create(body=metadata, fields='id').execute()
+        print(f'Folder ID: {file.get("id")}')
+        return file.get('id')
+    else:
+        return got[0].get('id')
 
 
 def read_section(config, key):
@@ -174,6 +186,9 @@ def get_config(location) -> KartkaConfig:
             sonic_port=read_conf(search, 'sonic_port'),
             sonic_password=read_conf(search, 'sonic_password'),
         ),
+        store=StoreConfig(
+            drive_kartka_dir=read_conf(store, 'drive_kartka_dir'),
+        ),
     )
 
 
@@ -189,6 +204,7 @@ def main(args):
     init_dirs(config)
 
     drive_service = login_to_drive(config.layout)
+    config.drive_base_id = init_drive(drive_service)
 
     loop = asyncio.get_event_loop()
     loop.run_until_complete(arguments.func(config, drive_service, arguments))
