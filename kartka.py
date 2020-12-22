@@ -36,6 +36,7 @@ async def ingest_and_upload(config: KartkaConfig, sonic: Client, drive_client, d
     converted_images = []
 
     if not doc.contents:
+        print('Scanning images..')
         doc.contents = ''
         for img in doc.images:
             with img:
@@ -150,7 +151,7 @@ async def scan_cmd(config: KartkaConfig, drive_client, args):
     result = input('Start ingesting? Y/n').lower()
     if result == 'y' or result == '':
         args.files = files_in_dir
-        await ingest_cmd(config, drive, args)
+        await ingest_cmd(config, drive_client, args)
     else:
         sys.exit(0)
 
