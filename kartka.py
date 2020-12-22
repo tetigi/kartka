@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # PYTHON_ARGCOMPLETE_OK
 
-from typing import List
+
+import drive
+from config import KartkaConfig, get_config
 
 from PIL import Image
-import configparser
 import pytesseract
 import asyncio
 import tempfile
+from typing import List
 from asonic import Client
 from asonic.enums import Channel
 from datetime import datetime
@@ -15,48 +17,9 @@ import os.path
 import pathlib
 import argparse
 import argcomplete
-import pickle
-import io
 import sys
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
 from dataclasses import dataclass
 from pdf2image import convert_from_bytes
-
-
-SCOPES = ['https://www.googleapis.com/auth/drive',
-          'https://www.googleapis.com/auth/drive.file']
-
-
-@dataclass
-class LayoutConfig:
-    data_dir: str
-    scan_dir: str
-    drive_credentials: str
-
-
-@dataclass
-class SearchConfig:
-    collection_name: str
-    bucket_name: str
-    sonic_host: str
-    sonic_port: int
-    sonic_password: str
-
-
-@dataclass
-class StoreConfig:
-    drive_kartka_dir: str
-
-
-@dataclass
-class KartkaConfig:
-    layout: LayoutConfig
-    search: SearchConfig
-    store: StoreConfig
-    drive_base_id: str = None
 
 
 @dataclass
@@ -68,8 +31,8 @@ class KartkaDocument:
     created_time: datetime = None
 
 
-async def process(config: KartkaConfig, sonic: Client, drive, doc: KartkaDocument):
-    """Processes the provided images, generating their containing texts and packaging them into zips"""
+async def ingest_and_upload(config: KartkaConfig, sonic: Client, drive_client, doc: KartkaDocument):
+    """Processes the provided images, generating their containing texts and packaging them into pdfs"""
     converted_images = []
 
     if not doc.contents:
@@ -88,10 +51,7 @@ async def process(config: KartkaConfig, sonic: Client, drive, doc: KartkaDocumen
         converted_images[0].save(output_path, save_all=True, append_images=converted_images[1:])
 
         print('Uploading to drive..')
-        file_metadata = {'name': doc.name, 'parents': [config.drive_base_id]}
-        media = MediaFileUpload(output_path, mimetype='application/pdf')
-        response = drive.files().create(body=file_metadata, media_body=media, fields='id').execute()
-        doc.drive_id = response.get('id')
+        doc.drive_id = drive.upload_pdf_file(config, drive_client, doc.name, output_path)
 
     print('Ingesting to sonic..')
     if not doc.created_time:
@@ -111,7 +71,7 @@ def decode_id(encoded_id: str) -> (str, str):
     return dt_str, file_id
 
 
-async def ingest_cmd(config: KartkaConfig, drive, args):
+async def ingest_cmd(config: KartkaConfig, drive_client, args):
     c = create_sonic_client(config)
     await c.channel(Channel.INGEST)
 
@@ -121,7 +81,7 @@ async def ingest_cmd(config: KartkaConfig, drive, args):
         images=list(Image.open(f) for f in args.files),
         name=output_file,
     )
-    await process(config, c, drive, doc)
+    await ingest_and_upload(config, c, drive_client, doc)
     print('Done')
 
 
@@ -139,64 +99,49 @@ async def search_cmd(config: KartkaConfig, _, args):
         print(f'{date_str.replace("_", " ")}\t -> https://drive.google.com/file/d/{file_id}/view?usp=sharing')
 
 
-async def check_cmd(config: KartkaConfig, drive, _):
+async def check_cmd(config: KartkaConfig, drive_client, _):
     c = create_sonic_client(config)
     await c.channel(Channel.SEARCH)
 
     assert(await c.ping() == b'PONG')
-    drive.files().list().execute()
+    drive_client.files().list().execute()
     print('All checks passed.')
 
 
-async def hydrate_cmd(config: KartkaConfig, drive, args):
+async def hydrate_cmd(config: KartkaConfig, drive_client, args):
     c = create_sonic_client(config)
     await c.channel(Channel.INGEST)
 
+    async def fun(drive_file):
+        file_bytes = drive.download_file(drive_client, drive_file.get('name'), drive_file.get('id'))
+
+        print('Converting to images..')
+        imgs = convert_from_bytes(file_bytes, grayscale=True, thread_count=8, dpi=100)
+        doc = KartkaDocument(
+            images=imgs,
+            name=drive_file.get('name'),
+            drive_id=drive_file.get('id'),
+            created_time=datetime.strptime(drive_file.get('createdTime'), '%Y-%m-%dT%H:%M:%S.%fZ')
+        )
+        print(f'Ingesting..')
+        await ingest_and_upload(config, c, drive, doc)
+
     print('Starting hydration from drive..')
-    page_token = None
-    while True:
-        response = drive.files().list(
-            q=f"'{config.drive_base_id}' in parents",
-            spaces='drive',
-            fields='nextPageToken, files(id, name, createdTime)',
-            pageToken=page_token
-        ).execute()
+    await drive.foreach_file(config, drive_client, 'files(id, name, createdTime)', fun)
 
-        for file in response.get('files', []):
-            print(f'Downloading {file.get("name")}..')
-            request = drive.files().get_media(fileId=file.get('id'))
-            fh = io.BytesIO()
-            downloader = MediaIoBaseDownload(fh, request)
-            done = False
-            while done is False:
-                status, done = downloader.next_chunk()
-                print('Downloaded %d%%..' % int(status.progress() * 100))
-
-            print('Converting to images..')
-            imgs = convert_from_bytes(fh.getvalue(), grayscale=True, thread_count=8, dpi=100)
-            doc = KartkaDocument(
-                images=imgs,
-                name=file.get('name'),
-                drive_id=file.get('id'),
-                created_time=datetime.strptime(file.get('createdTime'), '%Y-%m-%dT%H:%M:%S.%fZ')
-            )
-            print(f'Ingesting..')
-            await process(config, c, drive, doc)
-
-        page_token = response.get('nextPageToken', None)
-        if page_token is None:
-            break
-        print('Hydration complete!')
+    print('Hydration complete!')
 
 
-async def scan_cmd(config: KartkaConfig, drive, args):
+async def scan_cmd(config: KartkaConfig, drive_client, args):
     scan_dir = config.layout.scan_dir
     print('Starting scan workflow..')
     print('Please begin scanning documents into', config.layout.scan_dir)
     input('When finished, press enter')
 
     print('Attempting to consume..')
-    files_in_dir = [os.path.join(scan_dir, path) for path in os.listdir(scan_dir) if os.path.isfile(os.path.join(scan_dir, path))]
+    files_in_dir = [os.path.join(scan_dir, path)
+                    for path in os.listdir(scan_dir)
+                    if os.path.isfile(os.path.join(scan_dir, path))]
     files_in_dir.sort(key=lambda p: pathlib.Path(p).stat().st_ctime)
     print('Will ingest these files in this order:')
     for i, f in enumerate(files_in_dir):
@@ -223,106 +168,6 @@ def create_sonic_client(config: KartkaConfig) -> Client:
                   password=config.search.sonic_password)
 
 
-def login_to_drive(config: LayoutConfig):
-    creds = None
-    pickle_path = os.path.join(config.data_dir, 'token.pickle')
-    if os.path.exists(pickle_path):
-        with open(pickle_path, 'rb') as token:
-            creds = pickle.load(token)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(config.drive_credentials, SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open(pickle_path, 'wb') as token:
-            pickle.dump(creds, token)
-
-    return build('drive', 'v3', credentials=creds)
-
-
-def init_drive(drive) -> str:
-    response = drive.files().list(
-        q="name = 'kartka' and mimeType = 'application/vnd.google-apps.folder'",
-        spaces='drive',
-        fields='files(id, name)').execute()
-
-    got = response.get('files', [])
-
-    if not got:
-        print('Setting up drive directory..')
-        metadata = {
-            'name': 'kartka',
-            'mimeType': 'application/vnd.google-apps.folder',
-        }
-        file = drive.files().create(body=metadata, fields='id').execute()
-        print(f'Folder ID: {file.get("id")}')
-        return file.get('id')
-    else:
-        return got[0].get('id')
-
-
-def read_section(config, key):
-    if config.has_section(key):
-        return config[key]
-    else:
-        print(f'No section {key} found in provided configuration')
-        sys.exit(1)
-
-
-def read_conf(section, key):
-    if key in section:
-        return section[key]
-    else:
-        print(f'No {key} found in provided section')
-        sys.exit(1)
-
-
-def get_config(location) -> KartkaConfig:
-    config = configparser.ConfigParser(interpolation=configparser.ExtendedInterpolation())
-    config.read(location)
-
-    layout = read_section(config, 'layout')
-    search = read_section(config, 'search')
-    store = read_section(config, 'store')
-
-    return KartkaConfig(
-        layout=LayoutConfig(
-            data_dir=read_conf(layout, 'data_dir'),
-            scan_dir=read_conf(layout, 'scan_dir'),
-            drive_credentials=read_conf(layout, 'drive_credentials'),
-        ),
-        search=SearchConfig(
-            collection_name=read_conf(search, 'collection_name'),
-            bucket_name=read_conf(search, 'bucket_name'),
-            sonic_host=read_conf(search, 'sonic_host'),
-            sonic_port=read_conf(search, 'sonic_port'),
-            sonic_password=read_conf(search, 'sonic_password'),
-        ),
-        store=StoreConfig(
-            drive_kartka_dir=read_conf(store, 'drive_kartka_dir'),
-        ),
-    )
-
-
-def init_dirs(config: KartkaConfig):
-    os.makedirs(os.path.join(config.layout.data_dir, 'sonic'), exist_ok=True)
-    os.makedirs(os.path.join(config.layout.data_dir, 'files'), exist_ok=True)
-
-    os.makedirs(config.layout.scan_dir, exist_ok=True)
-
-
-def main(args):
-    config = get_config(args.config)
-    init_dirs(config)
-
-    drive_service = login_to_drive(config.layout)
-    config.drive_base_id = init_drive(drive_service)
-
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(arguments.func(config, drive_service, arguments))
-
-
 def sonic_suggestions(prefix, parsed_args, **kwargs):
     if len(prefix) < 2:
         return []
@@ -336,6 +181,24 @@ def sonic_suggestions(prefix, parsed_args, **kwargs):
 
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(do_it())
+
+
+def init_dirs(config: KartkaConfig):
+    os.makedirs(os.path.join(config.layout.data_dir, 'sonic'), exist_ok=True)
+    os.makedirs(os.path.join(config.layout.data_dir, 'files'), exist_ok=True)
+
+    os.makedirs(config.layout.scan_dir, exist_ok=True)
+
+
+def main(args):
+    config = get_config(args.config)
+    init_dirs(config)
+
+    drive_service = drive.login_to_drive(config.layout)
+    config.drive_base_id = drive.init_drive(config.store, drive_service)
+
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(arguments.func(config, drive_service, arguments))
 
 
 if __name__ == '__main__':

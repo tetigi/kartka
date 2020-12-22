@@ -4,3 +4,4 @@ token.pickle
 kartka.cfg
 venv/
 sonic.cfg
+__pycache__
