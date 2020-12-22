@@ -1,6 +1,6 @@
 [layout]
 data_dir = <HOME>/.kartka
-ingest_dir = <DOWNLOADS>/kartka
+scan_dir = <DOWNLOADS>/kartka
 drive_credentials = ${data_dir}/credentials.json
 
 [search]

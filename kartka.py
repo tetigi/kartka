@@ -12,6 +12,7 @@ from asonic import Client
 from asonic.enums import Channel
 from datetime import datetime
 import os.path
+import pathlib
 import argparse
 import argcomplete
 import pickle
@@ -32,7 +33,7 @@ SCOPES = ['https://www.googleapis.com/auth/drive',
 @dataclass
 class LayoutConfig:
     data_dir: str
-    ingest_dir: str
+    scan_dir: str
     drive_credentials: str
 
 
@@ -188,6 +189,34 @@ async def hydrate_cmd(config: KartkaConfig, drive, args):
         print('Hydration complete!')
 
 
+async def scan_cmd(config: KartkaConfig, drive, args):
+    scan_dir = config.layout.scan_dir
+    print('Starting scan workflow..')
+    print('Please begin scanning documents into', config.layout.scan_dir)
+    input('When finished, press enter')
+
+    print('Attempting to consume..')
+    files_in_dir = [os.path.join(scan_dir, path) for path in os.listdir(scan_dir) if os.path.isfile(os.path.join(scan_dir, path))]
+    files_in_dir.sort(key=lambda p: pathlib.Path(p).stat().st_ctime)
+    print('Will ingest these files in this order:')
+    for i, f in enumerate(files_in_dir):
+        print(f'{i + 1}) {f}')
+
+    result = input('Start ingesting? Y/n').lower()
+    if result == 'y' or result == '':
+        args.files = files_in_dir
+        await ingest_cmd(config, drive, args)
+    else:
+        sys.exit(0)
+
+    result = input('Delete scanned files? Y/n').lower()
+    if result == 'y' or result == '':
+        for f in files_in_dir:
+            print(f'Removing file {f}..')
+            os.remove(f)
+    print('Scan workflow complete!')
+
+
 def create_sonic_client(config: KartkaConfig) -> Client:
     return Client(host=config.search.sonic_host,
                   port=config.search.sonic_port,
@@ -260,7 +289,7 @@ def get_config(location) -> KartkaConfig:
     return KartkaConfig(
         layout=LayoutConfig(
             data_dir=read_conf(layout, 'data_dir'),
-            ingest_dir=read_conf(layout, 'ingest_dir'),
+            scan_dir=read_conf(layout, 'scan_dir'),
             drive_credentials=read_conf(layout, 'drive_credentials'),
         ),
         search=SearchConfig(
@@ -280,7 +309,7 @@ def init_dirs(config: KartkaConfig):
     os.makedirs(os.path.join(config.layout.data_dir, 'sonic'), exist_ok=True)
     os.makedirs(os.path.join(config.layout.data_dir, 'files'), exist_ok=True)
 
-    os.makedirs(config.layout.ingest_dir, exist_ok=True)
+    os.makedirs(config.layout.scan_dir, exist_ok=True)
 
 
 def main(args):
@@ -322,6 +351,9 @@ if __name__ == '__main__':
     ingest_parser = subparsers.add_parser('ingest', help='ingest a letter')
     ingest_parser.add_argument('files', nargs='+', help='in-order files to ingest')
     ingest_parser.set_defaults(func=ingest_cmd)
+
+    scan_parser = subparsers.add_parser('scan', help='start a scan ingest letter')
+    scan_parser.set_defaults(func=scan_cmd)
 
     search_parser = subparsers.add_parser('search', help='search for letters')
     search_parser.add_argument('search_terms', nargs='+', help='terms to search for').completer = sonic_suggestions
