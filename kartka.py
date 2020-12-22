@@ -124,7 +124,7 @@ async def hydrate_cmd(config: KartkaConfig, drive_client, args):
             created_time=datetime.strptime(drive_file.get('createdTime'), '%Y-%m-%dT%H:%M:%S.%fZ')
         )
         print(f'Ingesting..')
-        await ingest_and_upload(config, c, drive, doc)
+        await ingest_and_upload(config, c, drive_client, doc)
 
     print('Starting hydration from drive..')
     await drive.foreach_file(config, drive_client, 'files(id, name, createdTime)', fun)
