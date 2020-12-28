@@ -90,6 +90,7 @@ async def search_cmd(config: KartkaConfig, _, args):
     c = create_sonic_client(config)
     await c.channel(Channel.SEARCH)
 
+    print('Searching for terms:', args.search_terms)
     entries = await c.query(
         config.search.collection_name,
         config.search.bucket_name,
@@ -142,7 +143,8 @@ async def scan_cmd(config: KartkaConfig, drive_client, args):
     print('Attempting to consume..')
     files_in_dir = [os.path.join(scan_dir, path)
                     for path in os.listdir(scan_dir)
-                    if os.path.isfile(os.path.join(scan_dir, path))]
+                    if os.path.isfile(os.path.join(scan_dir, path))
+                    if path.endswith('jpg') or path.endswith('jpeg') or path.endswith('png')]
     files_in_dir.sort(key=lambda p: pathlib.Path(p).stat().st_ctime)
     print('Will ingest these files in this order:')
     for i, f in enumerate(files_in_dir):
