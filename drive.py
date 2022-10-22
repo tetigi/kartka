@@ -3,6 +3,7 @@ import pickle
 import os
 
 from config import KartkaConfig, LayoutConfig, StoreConfig
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -18,18 +19,21 @@ def login_to_drive(config: LayoutConfig):
        Then builds the Google Drive resource and returns it."""
 
     creds = None
-    pickle_path = os.path.join(config.data_dir, 'token.pickle')
-    if os.path.exists(pickle_path):
-        with open(pickle_path, 'rb') as token:
-            creds = pickle.load(token)
+    if os.path.exists('token.json'):
+        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    # pickle_path = os.path.join(config.data_dir, 'token.pickle')
+    # if os.path.exists(pickle_path):
+    #     with open(pickle_path, 'rb') as token:
+    #         creds = pickle.load(token)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
             flow = InstalledAppFlow.from_client_secrets_file(config.drive_credentials, SCOPES)
             creds = flow.run_local_server(port=0)
-        with open(pickle_path, 'wb') as token:
-            pickle.dump(creds, token)
+        with open('token.json', 'w') as token:
+            creds_as_json = creds.to_json()
+            token.write(creds_as_json)
 
     return build('drive', 'v3', credentials=creds)
 
