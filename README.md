@@ -1,3 +1,9 @@
+# Archived
+
+Check out the [new, better version instead](https://github.com/tetigi/kartka_rs/tree/develop).
+
+---
+
 # Kartka #
 
 Kartka is a tool for people who hate paper. It provides a workflow for scanning, indexing, and then uploading letters
